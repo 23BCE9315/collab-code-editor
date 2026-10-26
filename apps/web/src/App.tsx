@@ -38,7 +38,7 @@ interface AiMessage { role: "user" | "ai"; content: string; fixedCode?: string; 
 // CONSTANTS & HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const API = "http://localhost:4000";
+const API =  "https://collab-code-editor-br7u.onrender.com";;
 const ROLE_COLOR: Record<Role, string> = { owner: "#f59e0b", editor: "#007acc", viewer: "#6b7280" };
 const canEdit   = (r: Role | null) => r === "owner" || r === "editor";
 const canDelete = (r: Role | null) => r === "owner";
@@ -1030,7 +1030,7 @@ export default function App() {
   const [openFolders,   setOpenFolders]   = useState<Set<string>>(new Set());
   const [dirtyFiles,    setDirtyFiles]    = useState<Set<string>>(new Set());
   const [openFolderName, setOpenFolderName] = useState<string | null>(null); // VS Code "open folder" name
-  const [openFolderPath, setOpenFolderPath] = useState<string | null>(null); // absolute path for terminal cd
+  
   const [renamingPath,  setRenamingPath]  = useState<string | null>(null);
   const [renameVal,     setRenameVal]     = useState("");
 
@@ -1046,7 +1046,7 @@ export default function App() {
   const [panelHeight, setPanelHeight] = useState(260);
   const [termTabs,    setTermTabs]    = useState<TerminalTab[]>([]);
   const [activeTermId,setActiveTermId]= useState<string | null>(null);
-  const [output,      setOutput]      = useState<string[]>([]);
+  const [output] = useState<string[]>([]);
   const termCounter = useRef(0);
 
   // ── AI ────────────────────────────────────────────────────────────────────
@@ -1429,7 +1429,7 @@ export default function App() {
 
     const term = new Terminal({
       cursorBlink:          true,
-      cursorStyle:          "line",
+      cursorStyle: "bar",
       cursorInactiveStyle:  "underline",
       fontSize:             13,
       fontFamily:           "'Cascadia Code', 'Cascadia Mono', Menlo, 'DejaVu Sans Mono', Consolas, 'Courier New', monospace",
@@ -1663,10 +1663,10 @@ export default function App() {
           try { disposable.dispose(); } catch { }
           (termInst as any)._restartDisposable = null;
 
-          if (!roomIdRef.current) return;
+          if (!roomIdRef.current || !activeId) return;
 
-          // Re-register buffer so output has somewhere to go
-          termOutputBuffer.current.set(activeId, []);
+// Re-register buffer so output has somewhere to go
+termOutputBuffer.current.set(activeId, []);
           termReady.current.delete(activeId);
 
           // Use terminal-restart — spawns fresh PTY without page re-render
@@ -1794,11 +1794,11 @@ export default function App() {
 
     // Try to get the absolute folder path from the first file
     // Some browsers expose a non-standard .path or relativePath
-    const firstFileObj = Array.from(sel)[0];
-    const relPath      = (firstFileObj as any).webkitRelativePath || "";
+    
+    
     // relPath = "ai-resume-analyzer/backend/main.py"
     // We store the root folder name for terminal cd
-    const folderRootName = relPath.split("/")[0] || rootName;
+    
 
     // ── Clear existing workspace ──────────────────────────────────────────
     setFiles({});
@@ -1809,7 +1809,7 @@ export default function App() {
     // ── Load into state (deferred so UI doesn't freeze) ───────────────────
     setOpenFolders(new Set([...fp, rootName].filter(Boolean)));
     setOpenFolderName(rootName || "Folder");
-    setOpenFolderPath(null); // reset — user can set via terminal
+     // reset — user can set via terminal
 
     // Batch state update — single React render for all files
     setTimeout(() => {
@@ -1861,7 +1861,7 @@ export default function App() {
     setDirtyFiles(new Set());
     setOpenFolders(new Set());
     setOpenFolderName(null);
-    setOpenFolderPath(null);
+    
   }, []);
 
   const handleDownloadFile = useCallback((fn: string) => {
@@ -2677,7 +2677,7 @@ export default function App() {
                             // Store globally for new terminals
                             (window as any).__terminalCdPath = val;
                             // Send cd to all open terminals right now
-                            termInstances.current.forEach((inst, tid) => {
+                            termInstances.current.forEach(() => {
                               if (roomIdRef.current) {
                                 socket.emit("terminal-input", {
                                   roomId: roomIdRef.current,
