@@ -82,12 +82,20 @@ async function connectDB(): Promise<void> {
 
 // ─── Express ──────────────────────────────────────────────────────────────────
 
+
 const app = express();
+
 app.use(cors({
-  origin:  process.env.CLIENT_ORIGIN ?? "http://localhost:5173",
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://collab-code-editor-kappa.vercel.app"
+  ],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 }));
+
 app.use(express.json({ limit: "4mb" }));
+
 
 app.use("/api/run",   runCodeRouter);
 app.use("/api/rooms", roomsRouter);
@@ -101,11 +109,16 @@ const server = http.createServer(app);
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 
 const io = new Server(server, {
-  cors:    { origin: ["http://localhost:5173", "http://localhost:5174"], methods: ["GET", "POST"] },
-  transports:        ["websocket", "polling"],
-  pingInterval:      25_000,
-  pingTimeout:       20_000,
-  perMessageDeflate: { threshold: 2048 },
+  
+cors: {
+  origin: [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "https://collab-code-editor-kappa.vercel.app"
+  ],
+  methods: ["GET", "POST"]
+},
+
 });
 
 // ── Register workspace REST routes (needs io for clone→emit) ─────────────────
