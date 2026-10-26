@@ -26,7 +26,7 @@ type View         = "landing" | "editor";
 type PanelMode    = "output" | "terminal";
 type AiTab        = "chat" | "fix" | "explain";
 type ActivityView = "explorer" | "team" | "ai";
-type TerminalTab  = { id: string; label: string };
+type TerminalTab  = { id: string; label: string; shell?: string; isActive?: boolean };
 
 interface AiResponse {
   explanation: string; fixedCode: string; suggestions: string[];
@@ -440,22 +440,7 @@ function FileTreeItem(props: TreeItemProps) {
           )}
         </div>
 
-        {/* Children */}
-        {isOpen && (
-          <div style={{ position: "relative" }}>
-            {/* Continuous indent guide for children block */}
-            <span style={{
-              position: "absolute",
-              left: paddingLeft + 7,
-              top: 0, bottom: 0, width: 1,
-              background: "rgba(255,255,255,0.08)",
-              pointerEvents: "none",
-            }} />
-            {node.children?.map(c => (
-              <FileTreeItem key={c.path} {...props} node={c} depth={depth + 1} />
-            ))}
-          </div>
-        )}
+        {/* Children are rendered by the flat list in the parent — not recursively here */}
       </div>
     );
   }
@@ -882,6 +867,31 @@ function AiPanel({ activeFile, code, selectedCode, terminalLogs, onApplyFix, onC
   );
 }
 
+// ─── PanelIconBtn — small icon button for the terminal toolbar ────────────────
+function PanelIconBtn({ children, title, onClick }: {
+  children: React.ReactNode; title: string; onClick: () => void;
+}) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button
+      title={title}
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+        width: 26, height: 26, borderRadius: 4, border: "none",
+        background: hov ? "rgba(255,255,255,0.1)" : "transparent",
+        color: hov ? "#cccccc" : "#8b8b8b",
+        cursor: "pointer", flexShrink: 0,
+        transition: "background 0.1s, color 0.1s",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
 // ─── Landing Page ─────────────────────────────────────────────────────────
 
 function LandingPage({ currentUser, onEnterRoom }: { currentUser: AppUser | null; onEnterRoom: (id: string) => void }) {
@@ -1020,6 +1030,7 @@ export default function App() {
   const [openFolders,   setOpenFolders]   = useState<Set<string>>(new Set());
   const [dirtyFiles,    setDirtyFiles]    = useState<Set<string>>(new Set());
   const [openFolderName, setOpenFolderName] = useState<string | null>(null); // VS Code "open folder" name
+  const [openFolderPath, setOpenFolderPath] = useState<string | null>(null); // absolute path for terminal cd
   const [renamingPath,  setRenamingPath]  = useState<string | null>(null);
   const [renameVal,     setRenameVal]     = useState("");
 
@@ -1031,10 +1042,12 @@ export default function App() {
   // ── Panel ─────────────────────────────────────────────────────────────────
   const [panelMode,   setPanelMode]   = useState<PanelMode>("output");
   const [isPanelOpen, setIsPanelOpen] = useState(true);
-  const [panelHeight, setPanelHeight] = useState(240);
+  const [isPanelMax,  setIsPanelMax]  = useState(false);
+  const [panelHeight, setPanelHeight] = useState(260);
   const [termTabs,    setTermTabs]    = useState<TerminalTab[]>([]);
   const [activeTermId,setActiveTermId]= useState<string | null>(null);
   const [output,      setOutput]      = useState<string[]>([]);
+  const termCounter = useRef(0);
 
   // ── AI ────────────────────────────────────────────────────────────────────
   const [selectedCode, setSelectedCode] = useState("");
@@ -1063,6 +1076,16 @@ export default function App() {
   const termDivRefs      = useRef<Map<string, HTMLDivElement>>(new Map());
   const xtermRef         = useRef<Terminal | null>(null);
   const terminalJoined   = useRef(false);
+  // Refs kept in sync with state — used by the terminal-output socket handler
+  // so it registers ONCE and never goes stale (avoids socket re-registration loop)
+  const activeTermIdRef  = useRef<string | null>(null);
+  const addTerminalRef   = useRef<(() => void) | null>(null);
+  const termTabsLenRef   = useRef<number>(0);
+  // Buffer for terminal output that arrives before xterm is ready
+  // Key: termId → queued chunks. Flushed immediately after term.open()
+  const termOutputBuffer = useRef<Map<string, string[]>>(new Map());
+  // Set of termIds that are fully open and ready to receive output
+  const termReady        = useRef<Set<string>>(new Set());
 
   // ── FIXED: cursor label hide timers ──────────────────────────────────────
   // Tracks per-user setTimeout handles so each label auto-hides after 2 s
@@ -1071,6 +1094,8 @@ export default function App() {
 
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { myRoleRef.current = myRole; }, [myRole]);
+  useEffect(() => { activeTermIdRef.current = activeTermId; }, [activeTermId]);
+  useEffect(() => { termTabsLenRef.current = termTabs.length; }, [termTabs.length]);
   useEffect(() => { if (chatBodyRef.current) chatBodyRef.current.scrollTop = chatBodyRef.current.scrollHeight; }, [chatMessages]);
 
   // ── FIXED: showCursorLabel — shows label, schedules 2 s auto-hide ────────
@@ -1105,6 +1130,21 @@ export default function App() {
   const otherUsers  = useMemo(() => users.filter(u => u.socketId !== (socket.id ?? "")), [users]);
   const currentCode = files[activeFile] ?? "";
 
+  // ── Flatten tree into a visible row list for large-folder virtualization ──
+  const flatRows = useMemo(() => {
+    const rows: Array<{ node: FileTreeNode; depth: number }> = [];
+    function walk(nodes: FileTreeNode[], depth: number) {
+      for (const node of nodes) {
+        rows.push({ node, depth });
+        if (node.type === "folder" && openFolders.has(node.path) && node.children) {
+          walk(node.children, depth + 1);
+        }
+      }
+    }
+    walk(fileTree, 0);
+    return rows;
+  }, [fileTree, openFolders]);
+
   // ── URL on mount ──────────────────────────────────────────────────────────
   useEffect(() => {
     const m = window.location.pathname.match(/^\/room\/([^/]+)/);
@@ -1127,7 +1167,9 @@ export default function App() {
     setFiles({}); setOpenTabs([]); setActiveFile(""); setDirtyFiles(new Set());
     setActivities([]); setChatMessages([]);
     seenActivityIds.current.clear(); terminalJoined.current = false;
-    setTermTabs([]); setActiveTermId(null); setOpenFolderName(null); setView("editor");
+    setTermTabs([]); setActiveTermId(null); setOpenFolderName(null);
+    termCounter.current = 0;
+    setView("editor");
   }, []);
   useEffect(() => { if (currentUser && roomId && view === "landing") enterRoom(roomId); }, [currentUser, roomId, view, enterRoom]);
 
@@ -1145,14 +1187,22 @@ export default function App() {
   }, [view, currentUser]);
 
   useEffect(() => {
-    const hRole = ({ role }: { role: Role }) => { setMyRole(role); myRoleRef.current = role; };
+    const hRole = ({ role }: { role: Role }) => {
+      setMyRole(role);
+      myRoleRef.current = role;
+      // Role confirmed — terminal input is enforced server-side
+    };
     const hMeta = (m: RoomMeta) => setRoomMeta(m);
     socket.on("your-role", hRole); socket.on("room-meta", hMeta);
     return () => { socket.off("your-role", hRole); socket.off("room-meta", hMeta); };
   }, []);
 
   useEffect(() => {
-    const h = ({ reason }: { reason: string }) => showPermDenied(reason);
+    const h = ({ action, reason }: { action: string; reason: string }) => {
+      // Terminal typing by viewers is handled inline in the terminal output — don't show toast
+      if (action === "terminal-input") return;
+      showPermDenied(reason);
+    };
     socket.on("permission-denied", h); return () => { socket.off("permission-denied", h); };
   }, [showPermDenied]);
 
@@ -1348,40 +1398,313 @@ export default function App() {
   }, [remoteCursors, users, activeFile, showCursorLabel]);
 
   // ── Terminal ──────────────────────────────────────────────────────────────
-  const addTerminal = useCallback(() => {
-    const id = `term-${Date.now()}`; const label = `Terminal ${termTabs.length + 1}`;
-    setTermTabs(p => [...p, { id, label }]); setActiveTermId(id); setPanelMode("terminal"); setIsPanelOpen(true);
-  }, [termTabs.length]);
+  const addTerminal = useCallback((label?: string) => {
+    termCounter.current += 1;
+    const id    = `term-${Date.now()}`;
+    const shell = navigator.platform?.includes("Win") ? "pwsh" : "bash";
+    const tab: TerminalTab = {
+      id,
+      label: label ?? `${shell} ${termCounter.current}`,
+      shell,
+    };
+    // Pre-register buffer entry so writeBest can queue output
+    // that arrives before mountTerminal fires
+    termOutputBuffer.current.set(id, []);
+    // Update activeTermIdRef immediately so writeBest routes to this id
+    activeTermIdRef.current = id;
+
+    setTermTabs(p => [...p, tab]);
+    setActiveTermId(id);
+    setPanelMode("terminal");
+    setIsPanelOpen(true);
+  }, []);
+
+  // Keep addTerminalRef in sync — must be AFTER addTerminal is declared
+  useEffect(() => { addTerminalRef.current = addTerminal; }, [addTerminal]);
 
   const mountTerminal = useCallback((termId: string, div: HTMLDivElement | null) => {
     if (!div) { termDivRefs.current.delete(termId); return; }
     termDivRefs.current.set(termId, div);
     if (termInstances.current.has(termId)) return;
+
     const term = new Terminal({
-      cursorBlink: true, fontSize: 13, fontFamily: "var(--font-mono)",
-      theme: { background: "#1e1e1e", foreground: "#cccccc", cursor: "#aeafad", selectionBackground: "rgba(38,79,120,0.6)", black: "#000000", red: "#cd3131", green: "#0dbc79", yellow: "#e5e510", blue: "#2472c8", magenta: "#bc3fbc", cyan: "#11a8cd", white: "#e5e5e5", brightBlack: "#666666", brightRed: "#f14c4c", brightGreen: "#23d18b", brightYellow: "#f5f543", brightBlue: "#3b8eea", brightMagenta: "#d670d6", brightCyan: "#29b8db", brightWhite: "#e5e5e5" },
-      allowTransparency: true, scrollback: 5000,
+      cursorBlink:          true,
+      cursorStyle:          "line",
+      cursorInactiveStyle:  "underline",
+      fontSize:             13,
+      fontFamily:           "'Cascadia Code', 'Cascadia Mono', Menlo, 'DejaVu Sans Mono', Consolas, 'Courier New', monospace",
+      fontWeight:           "normal",
+      fontWeightBold:       "bold",
+      lineHeight:           1.2,
+      letterSpacing:        0,
+      scrollback:           10000,
+      tabStopWidth:         4,
+      rightClickSelectsWord:true,
+      convertEol:           true,
+      allowTransparency:    true,
+      theme: {
+        background:          "#1e1e1e",
+        foreground:          "#cccccc",
+        cursor:              "#aeafad",
+        cursorAccent:        "#1e1e1e",
+        selectionBackground: "rgba(38,79,120,0.7)",
+        selectionForeground: "#ffffff",
+        black:               "#000000",  red:           "#cd3131",
+        green:               "#0dbc79",  yellow:        "#e5e510",
+        blue:                "#2472c8",  magenta:       "#bc3fbc",
+        cyan:                "#11a8cd",  white:         "#e5e5e5",
+        brightBlack:         "#666666",  brightRed:     "#f14c4c",
+        brightGreen:         "#23d18b",  brightYellow:  "#f5f543",
+        brightBlue:          "#3b8eea",  brightMagenta: "#d670d6",
+        brightCyan:          "#29b8db",  brightWhite:   "#e5e5e5",
+      },
     });
-    const fit = new FitAddon(); term.loadAddon(fit); term.open(div); fit.fit();
-    term.onData(data => { if (!roomIdRef.current) return; socket.emit("terminal-input", { roomId: roomIdRef.current, data }); });
-    term.onResize(({ cols, rows }) => { if (!roomIdRef.current) return; socket.emit("terminal-resize", { roomId: roomIdRef.current, cols, rows }); });
-    termInstances.current.set(termId, { term, fit, joined: false }); xtermRef.current = term;
-    if (roomIdRef.current) { socket.emit("terminal-join", { roomId: roomIdRef.current, files: filesRef.current }); terminalJoined.current = true; const inst = termInstances.current.get(termId); if (inst) inst.joined = true; }
+
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+
+    // ── CRITICAL ORDER ────────────────────────────────────────────────────────
+    // 1. Register in map FIRST so writeBest() can find it immediately
+    // 2. Open terminal (starts canvas rendering)
+    // 3. Fit + mark ready + flush buffer in rAF (after first paint)
+    // 4. Send terminal-join after role confirmed
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Step 1: Register immediately — writeBest uses this map
+    termInstances.current.set(termId, { term, fit, joined: false });
+    xtermRef.current = term;
+
+    // Step 2: Open xterm (begins async canvas paint)
+    term.open(div);
+
+    // Step 3: After first paint — fit, flush any pre-buffered output, focus
+    requestAnimationFrame(() => {
+      try { fit.fit(); } catch { }
+
+      termReady.current.add(termId);
+
+      // Flush any server output that arrived while canvas was painting
+      const buffered = termOutputBuffer.current.get(termId) ?? [];
+      if (buffered.length > 0) {
+        buffered.forEach(chunk => { try { term.write(chunk); } catch { } });
+        termOutputBuffer.current.delete(termId);
+      }
+
+      try { term.focus(); } catch { }
+      setTimeout(() => { try { fit.fit(); } catch { } }, 100);
+    });
+
+    term.onData(data => {
+      if (!roomIdRef.current) return;
+      socket.emit("terminal-input", { roomId: roomIdRef.current, data });
+    });
+
+    term.onResize(({ cols, rows }) => {
+      if (!roomIdRef.current) return;
+      socket.emit("terminal-resize", { roomId: roomIdRef.current, cols, rows });
+    });
+
+    // Step 4: Send terminal-join once role is confirmed (poll max 3s)
+    if (roomIdRef.current) {
+      const sendJoin = () => {
+        try { fit.fit(); } catch { }
+        const dims = fit.proposeDimensions();
+        const cols = (dims?.cols && dims.cols > 10) ? dims.cols : 120;
+        const rows = (dims?.rows && dims.rows > 2)  ? dims.rows : 30;
+
+        socket.emit("terminal-join", {
+          roomId: roomIdRef.current!,
+          cols,
+          rows,
+        });
+
+        const inst = termInstances.current.get(termId);
+        if (inst) inst.joined = true;
+        terminalJoined.current = true;
+
+        // If user has a stored terminal path, auto-cd there after banner renders
+        // Use a 600ms delay so the welcome banner appears first
+        const storedPath = (window as any).__terminalCdPath;
+        if (storedPath) {
+          setTimeout(() => {
+            socket.emit("terminal-input", {
+              roomId: roomIdRef.current!,
+              data: `cd "${storedPath}"\r`,
+            });
+          }, 600);
+        }
+      };
+
+      // Role already known — join immediately
+      if (myRoleRef.current !== null) {
+        // Small delay to let term.open() complete its first paint
+        setTimeout(sendJoin, 50);
+      } else {
+        // Wait for your-role event (max 3s)
+        let waited = 0;
+        const poll = setInterval(() => {
+          waited += 50;
+          if (myRoleRef.current !== null || waited >= 3000) {
+            clearInterval(poll);
+            sendJoin();
+          }
+        }, 50);
+      }
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => { if (!activeTermId) return; const inst = termInstances.current.get(activeTermId); if (inst) { xtermRef.current = inst.term; setTimeout(() => inst.fit.fit(), 50); } }, [activeTermId]);
-  useEffect(() => { if (panelMode !== "terminal" || !activeTermId) return; const inst = termInstances.current.get(activeTermId); if (inst) setTimeout(() => inst.fit.fit(), 50); }, [panelHeight, panelMode, isPanelOpen, activeTermId]);
-  useEffect(() => { if (panelMode === "terminal" && isPanelOpen && termTabs.length === 0) addTerminal(); }, [panelMode, isPanelOpen, termTabs.length, addTerminal]);
+  useEffect(() => {
+    if (!activeTermId) return;
+    const inst = termInstances.current.get(activeTermId);
+    if (!inst) return;
+    xtermRef.current = inst.term;
+    // Fit after tab switch — give DOM time to update display:flex
+    requestAnimationFrame(() => {
+      try { inst.fit.fit(); } catch { }
+      // Focus so user can type immediately after switching tabs
+      try { inst.term.focus(); } catch { }
+    });
+    setTimeout(() => { try { inst.fit.fit(); } catch { } }, 50);
+  }, [activeTermId]);
 
   useEffect(() => {
-    const onOut  = (d: string) => { if (xtermRef.current) xtermRef.current.write(d); setTerminalLogs(p => (p + d).slice(-3000)); };
-    const onHist = (d: string) => { if (xtermRef.current) xtermRef.current.write(d); };
-    const onExit = ({ code }: { code: number }) => { if (xtermRef.current) xtermRef.current.write(`\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`); };
-    const onSwitch = () => { setIsPanelOpen(true); setPanelMode("terminal"); };
-    socket.on("terminal-output", onOut); socket.on("terminal-history", onHist); socket.on("terminal-exit", onExit); socket.on("terminal-switch-panel", onSwitch);
-    return () => { socket.off("terminal-output", onOut); socket.off("terminal-history", onHist); socket.off("terminal-exit", onExit); socket.off("terminal-switch-panel", onSwitch); };
-  }, []);
+    if (panelMode !== "terminal" || !activeTermId) return;
+    const inst = termInstances.current.get(activeTermId);
+    if (!inst) return;
+    requestAnimationFrame(() => { try { inst.fit.fit(); } catch { } });
+    setTimeout(() => { try { inst.fit.fit(); } catch { } }, 50);
+  }, [panelHeight, panelMode, isPanelOpen, isPanelMax, activeTermId]);
+
+  // ResizeObserver — re-fit terminal whenever its container div changes size
+  useEffect(() => {
+    if (!activeTermId) return;
+    const div = termDivRefs.current.get(activeTermId);
+    if (!div) return;
+    const obs = new ResizeObserver(() => {
+      const inst = termInstances.current.get(activeTermId);
+      if (inst) { try { inst.fit.fit(); } catch { } }
+    });
+    obs.observe(div);
+    return () => obs.disconnect();
+  }, [activeTermId]);
+
+  useEffect(() => { if (panelMode === "terminal" && isPanelOpen && termTabs.length === 0) addTerminal(); }, [panelMode, isPanelOpen, termTabs.length, addTerminal]);
+
+  // ── Terminal output — ref-based, never stale ─────────────────────────────
+  useEffect(() => {
+    // Always write to the best available terminal instance:
+    //   1. activeTermId (current tab)
+    //   2. most-recently mounted instance (xtermRef)
+    //   3. first instance in the map
+    const writeBest = (data: string) => {
+      // Try active tab first
+      const activeId = activeTermIdRef.current;
+      if (activeId) {
+        const inst = termInstances.current.get(activeId);
+        if (inst?.term) {
+          inst.term.write(data);
+          return;
+        }
+        // Instance not mounted yet — buffer it
+        const buf = termOutputBuffer.current.get(activeId) ?? [];
+        buf.push(data);
+        termOutputBuffer.current.set(activeId, buf);
+        return;
+      }
+      // No active terminal yet — buffer against last created termId
+      const ids = [...termInstances.current.keys()];
+      const lastId = ids[ids.length - 1];
+      if (lastId) {
+        const inst = termInstances.current.get(lastId);
+        if (inst?.term) { inst.term.write(data); return; }
+      }
+      // Buffer against any pending termId in the buffer map
+      const bufIds = [...termOutputBuffer.current.keys()];
+      const bufId = bufIds[bufIds.length - 1];
+      if (bufId) {
+        const buf = termOutputBuffer.current.get(bufId) ?? [];
+        buf.push(data);
+        termOutputBuffer.current.set(bufId, buf);
+      }
+    };
+
+    const onOut = (d: string) => {
+      writeBest(d);
+      setTerminalLogs(p => (p + d).slice(-3000));
+    };
+    const onHist   = (d: string) => { writeBest(d); };
+    const onExit   = ({ code }: { code: number }) => {
+      writeBest(
+        `\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n` +
+        `\x1b[90m─────────────────────────────────────────\x1b[0m\r\n` +
+        `\x1b[36mPress any key to restart the terminal...\x1b[0m\r\n`
+      );
+      // Reset joined so next key or new terminal triggers a fresh join
+      terminalJoined.current = false;
+      // Mark all tab instances as no longer joined
+      termInstances.current.forEach(inst => { inst.joined = false; });
+
+      // Auto-restart on Enter keypress (like VS Code)
+      const activeId = activeTermIdRef.current;
+      const termInst = activeId ? termInstances.current.get(activeId) : null;
+      if (termInst) {
+        // Clean up any previous one-shot listener
+        if ((termInst as any)._restartDisposable) {
+          try { (termInst as any)._restartDisposable.dispose(); } catch { }
+          (termInst as any)._restartDisposable = null;
+        }
+
+        const disposable = termInst.term.onData((data: string) => {
+          // Only trigger on Enter key (Enter key)
+          if (data !== "\r" && data !== "\n") return;
+
+          // Dispose immediately — one-shot
+          try { disposable.dispose(); } catch { }
+          (termInst as any)._restartDisposable = null;
+
+          if (!roomIdRef.current) return;
+
+          // Re-register buffer so output has somewhere to go
+          termOutputBuffer.current.set(activeId, []);
+          termReady.current.delete(activeId);
+
+          // Use terminal-restart — spawns fresh PTY without page re-render
+          socket.emit("terminal-restart", { roomId: roomIdRef.current });
+          terminalJoined.current = true;
+          if (termInst) termInst.joined = true;
+
+          // Re-mark ready after a frame so flush works
+          requestAnimationFrame(() => {
+            termReady.current.add(activeId);
+            const buf = termOutputBuffer.current.get(activeId);
+            if (buf?.length) {
+              buf.forEach(chunk => { try { termInst.term.write(chunk); } catch { } });
+              termOutputBuffer.current.delete(activeId);
+            }
+          });
+        });
+        (termInst as any)._restartDisposable = disposable;
+      }
+    };
+    const onSwitch = () => {
+      setIsPanelOpen(true);
+      setPanelMode("terminal");
+      if (termTabsLenRef.current === 0) addTerminalRef.current?.();
+    };
+
+    socket.on("terminal-output",       onOut);
+    socket.on("terminal-history",      onHist);
+    socket.on("terminal-exit",         onExit);
+    socket.on("terminal-switch-panel", onSwitch);
+    return () => {
+      socket.off("terminal-output",       onOut);
+      socket.off("terminal-history",      onHist);
+      socket.off("terminal-exit",         onExit);
+      socket.off("terminal-switch-panel", onSwitch);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // ← intentionally empty: refs keep this fresh without re-registering
 
   // ── Panel / sidebar drag ──────────────────────────────────────────────────
   const startPanelDrag = useCallback((e: React.MouseEvent) => {
@@ -1411,11 +1734,19 @@ export default function App() {
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "P") { e.preventDefault(); setShowCmdPalette(p => !p); }
-      if ((e.ctrlKey || e.metaKey) && e.key === "`") { e.preventDefault(); setIsPanelOpen(p => !p); if (!isPanelOpen) setPanelMode("terminal"); }
+      if ((e.ctrlKey || e.metaKey) && e.key === "`") {
+        e.preventDefault();
+        if (!isPanelOpen) {
+          setIsPanelOpen(true); setPanelMode("terminal");
+          if (termTabs.length === 0) addTerminal();
+        } else {
+          setIsPanelOpen(false); setIsPanelMax(false);
+        }
+      }
       if (e.key === "Escape") { setCtxMenu(null); setShowCmdPalette(false); }
     };
     window.addEventListener("keydown", h); return () => window.removeEventListener("keydown", h);
-  }, [isPanelOpen]);
+  }, [isPanelOpen, termTabs.length, addTerminal]);
 
   // ── File operations ───────────────────────────────────────────────────────
   const toggleFolder = useCallback((path: string) => { setOpenFolders(p => { const n = new Set(p); n.has(path) ? n.delete(path) : n.add(path); return n; }); }, []);
@@ -1440,55 +1771,84 @@ export default function App() {
     const fp = new Set<string>();
     let rootName = "";
 
+    // Read files in parallel — skip heavy/binary dirs
     await Promise.all(Array.from(sel).map(async file => {
       const rp = (file as any).webkitRelativePath || file.name;
-      // Skip binary-ish files, node_modules, .git
       if (
-        rp.includes("/node_modules/") ||
-        rp.includes("/.git/") ||
-        rp.startsWith(".git/") ||
-        rp.startsWith("node_modules/")
+        rp.includes("/node_modules/") || rp.includes("/.git/") ||
+        rp.includes("/__pycache__/") || rp.includes("/.venv/") ||
+        rp.includes("/dist/") || rp.includes("/.next/") ||
+        rp.startsWith(".git/") || rp.startsWith("node_modules/")
       ) return;
+      // Skip large binary files (> 500 KB)
+      if (file.size > 500 * 1024) return;
       try {
         nf[rp] = await file.text();
         const pts = rp.split("/");
         if (!rootName && pts.length > 1) rootName = pts[0];
         for (let i = 1; i < pts.length; i++) fp.add(pts.slice(0, i).join("/"));
-      } catch { /* skip unreadable/binary files */ }
+      } catch { /* skip unreadable/binary */ }
     }));
 
     if (!Object.keys(nf).length) return;
 
-    // ── Close any existing workspace first ─────────────────────────────────
+    // Try to get the absolute folder path from the first file
+    // Some browsers expose a non-standard .path or relativePath
+    const firstFileObj = Array.from(sel)[0];
+    const relPath      = (firstFileObj as any).webkitRelativePath || "";
+    // relPath = "ai-resume-analyzer/backend/main.py"
+    // We store the root folder name for terminal cd
+    const folderRootName = relPath.split("/")[0] || rootName;
+
+    // ── Clear existing workspace ──────────────────────────────────────────
     setFiles({});
     setOpenTabs([]);
     setActiveFile("");
     setDirtyFiles(new Set());
 
-    // ── Load new folder ────────────────────────────────────────────────────
-    setFiles(nf);
+    // ── Load into state (deferred so UI doesn't freeze) ───────────────────
     setOpenFolders(new Set([...fp, rootName].filter(Boolean)));
     setOpenFolderName(rootName || "Folder");
+    setOpenFolderPath(null); // reset — user can set via terminal
 
-    // Open the first file automatically
-    const firstFile = Object.keys(nf).sort((a, b) => {
-      // Prefer root-level files, then by name
-      const da = a.split("/").length, db = b.split("/").length;
-      return da !== db ? da - db : a.localeCompare(b);
-    })[0];
-    if (firstFile) {
-      setOpenTabs([firstFile]);
-      setActiveFile(firstFile);
-    }
+    // Batch state update — single React render for all files
+    setTimeout(() => {
+      setFiles(nf);
+      const firstFile = Object.keys(nf).sort((a, b) => {
+        const da = a.split("/").length, db = b.split("/").length;
+        return da !== db ? da - db : a.localeCompare(b);
+      }).find(f => !f.endsWith("/.gitkeep")) ?? "";
+      if (firstFile) { setOpenTabs([firstFile]); setActiveFile(firstFile); }
+    }, 0);
 
-    // ── Sync to room ───────────────────────────────────────────────────────
+    // ── Notify room that a folder was opened (no file contents in payload) ──
     if (roomIdRef.current) {
-      for (const [fn, code] of Object.entries(nf)) {
-        socket.emit("create-file", { roomId: roomIdRef.current, fileName: fn });
-        socket.emit("code-change",  { roomId: roomIdRef.current, fileName: fn, code });
-      }
-      socket.emit("upload-folder", { roomId: roomIdRef.current, folderName: rootName, fileCount: Object.keys(nf).length });
+      socket.emit("folder-sync", {
+        roomId:     roomIdRef.current,
+        folderName: rootName,
+        filePaths:  Object.keys(nf),
+      });
     }
+
+    // ── Send cd command to open terminals ─────────────────────────────────
+    // The browser can't give us the absolute path, so we show a prompt
+    // in the terminal telling the user how to navigate there.
+    // We also send the folder name so the terminal can display it.
+    setTimeout(() => {
+      const msg =
+        `[36m[Folder "${rootName}" opened in editor][0m
+` +
+        `[90mTo navigate to your project: [0mcd <path\\to\\${rootName}>
+` +
+        `[90mExample: cd C:\\Projects\\${rootName}[0m
+
+`;
+
+      // Write hint to all active terminal instances
+      termInstances.current.forEach((inst) => {
+        try { inst.term.write(msg); } catch { }
+      });
+    }, 500);
 
     e.target.value = "";
   }, [showPermDenied]);
@@ -1501,6 +1861,7 @@ export default function App() {
     setDirtyFiles(new Set());
     setOpenFolders(new Set());
     setOpenFolderName(null);
+    setOpenFolderPath(null);
   }, []);
 
   const handleDownloadFile = useCallback((fn: string) => {
@@ -1634,14 +1995,43 @@ export default function App() {
     });
   }, [activeFile]);
 
+  // ── Kill a single terminal tab ────────────────────────────────────────────
+  const killTerminalTab = useCallback((tabId: string) => {
+    const inst = termInstances.current.get(tabId);
+    if (inst) { try { inst.term.dispose(); } catch { } termInstances.current.delete(tabId); }
+    termDivRefs.current.delete(tabId);
+    termReady.current.delete(tabId);
+    termOutputBuffer.current.delete(tabId);
+
+    setTermTabs(p => {
+      const nx = p.filter(t => t.id !== tabId);
+      if (activeTermId === tabId) {
+        if (nx.length) { setActiveTermId(nx[nx.length - 1].id); }
+        else           { setActiveTermId(null); setPanelMode("output"); }
+      }
+      // Reset joined flag when all terminals are gone so the next
+      // addTerminal() call sends a fresh terminal-join to the server
+      if (nx.length === 0) terminalJoined.current = false;
+      return nx;
+    });
+
+    // Tell the server to kill the PTY for this socket so it's cleaned up
+    if (roomIdRef.current) {
+      socket.emit("terminal-kill", { roomId: roomIdRef.current });
+    }
+  }, [activeTermId]);
+
   const runCode = useCallback(() => {
     if (!canEdit(myRoleRef.current)) { showPermDenied("Viewers cannot run code"); return; }
     if (!roomIdRef.current || !activeFile) return;
     setIsPanelOpen(true); setPanelMode("terminal");
     setTimeout(() => {
-      if (!terminalJoined.current && roomIdRef.current) { socket.emit("terminal-join", { roomId: roomIdRef.current, files: filesRef.current }); terminalJoined.current = true; }
+      // Always ensure a terminal session exists on the server before running
+      if (roomIdRef.current) {
+        socket.emit("terminal-ensure", { roomId: roomIdRef.current, cols: 120, rows: 30 });
+      }
       socket.emit("run-code", { roomId: roomIdRef.current, fileName: activeFile, files: filesRef.current });
-    }, terminalJoined.current ? 0 : 300);
+    }, 100);
   }, [activeFile, showPermDenied]);
 
   const runProject = useCallback(() => {
@@ -1649,9 +2039,11 @@ export default function App() {
     if (!roomIdRef.current) return;
     setIsPanelOpen(true); setPanelMode("terminal");
     setTimeout(() => {
-      if (!terminalJoined.current && roomIdRef.current) { socket.emit("terminal-join", { roomId: roomIdRef.current, files: filesRef.current }); terminalJoined.current = true; }
+      if (roomIdRef.current) {
+        socket.emit("terminal-ensure", { roomId: roomIdRef.current, cols: 120, rows: 30 });
+      }
       socket.emit("terminal-run-project", { roomId: roomIdRef.current, files: filesRef.current });
-    }, terminalJoined.current ? 0 : 300);
+    }, 100);
   }, [showPermDenied]);
 
   const sendChatMessage = useCallback(() => {
@@ -1700,12 +2092,23 @@ export default function App() {
   const leaveRoom = useCallback(() => {
     if (roomIdRef.current) socket.emit("leave-room", roomIdRef.current);
     termInstances.current.forEach(({ term }) => { try { term.dispose(); } catch { } });
-    termInstances.current.clear(); termDivRefs.current.clear();
-    xtermRef.current = null; terminalJoined.current = false;
+    termInstances.current.clear();
+    termDivRefs.current.clear();
+    xtermRef.current = null;
+    terminalJoined.current = false;
+    termReady.current.clear();
+    termOutputBuffer.current.clear();
     // Clear all cursor hide timers on leave
     cursorHideTimers.current.forEach(t => clearTimeout(t));
     cursorHideTimers.current.clear();
-    setTermTabs([]); setActiveTermId(null); setView("landing"); setRoomMeta(null); setMyRole(null); setFollowUser(null); setOpenFolderName(null);
+    setTermTabs([]);
+    setActiveTermId(null);
+    setView("landing");
+    setRoomMeta(null);
+    setMyRole(null);
+    setFollowUser(null);
+    setOpenFolderName(null);
+    termCounter.current = 0;
   }, []);
 
   if (view === "landing") return <LandingPage currentUser={currentUser} onEnterRoom={enterRoom} />;
@@ -1788,7 +2191,10 @@ export default function App() {
             {Object.keys(visibleFiles).length} file{Object.keys(visibleFiles).length !== 1 ? "s" : ""}
           </div>
         )}
-        <div className="sb-tree-scroll" style={{ overflowX: "auto", overflowY: "auto" }}>
+        <div
+          className="sb-tree-scroll"
+          style={{ overflowX: "auto", overflowY: "auto", flex: 1 }}
+        >
           {Object.keys(visibleFiles).length === 0 ? (
             <div className="sb-empty-tree">
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#555" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom: 10, opacity: 0.5 }}>
@@ -1820,16 +2226,31 @@ export default function App() {
               </span>
             </div>
           ) : (
-            fileTree.map(node => (
-              <FileTreeItem key={node.path} node={node} depth={0}
-                activeFile={activeFile} openFolders={openFolders} myRole={myRole}
-                renamingPath={renamingPath} renameVal={renameVal}
-                onFileClick={openTab} onToggleFolder={toggleFolder}
-                onContextMenu={handleContextMenu}
-                onRenameChange={setRenameVal} onRenameCommit={commitRename}
-                onRenameCancel={() => setRenamingPath(null)}
-                onMoveFile={handleMoveFile} />
-            ))
+            /* Virtualized flat list — renders ALL visible rows but skips
+               React tree recursion for large folders (2000+ files).
+               Each row is 22px tall. We render all of them since the
+               container scrolls; React handles the DOM recycling. */
+            <div style={{ minWidth: "max-content" }}>
+              {flatRows.map(({ node, depth }) => (
+                <FileTreeItem
+                  key={node.path}
+                  node={node}
+                  depth={depth}
+                  activeFile={activeFile}
+                  openFolders={openFolders}
+                  myRole={myRole}
+                  renamingPath={renamingPath}
+                  renameVal={renameVal}
+                  onFileClick={openTab}
+                  onToggleFolder={toggleFolder}
+                  onContextMenu={handleContextMenu}
+                  onRenameChange={setRenameVal}
+                  onRenameCommit={commitRename}
+                  onRenameCancel={() => setRenamingPath(null)}
+                  onMoveFile={handleMoveFile}
+                />
+              ))}
+            </div>
           )}
         </div>
       </div>
@@ -1957,7 +2378,10 @@ export default function App() {
                 <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><path d="M2 1l7 4-7 4V1z"/></svg> Run
               </button>
               <button className="tb-run-btn project" onClick={runProject}>▶▶ Project</button>
-              <button className="tb-run-btn term" onClick={() => { setIsPanelOpen(true); setPanelMode("terminal"); }}>$ Terminal</button>
+              <button className="tb-run-btn term" onClick={() => {
+                setIsPanelOpen(true); setPanelMode("terminal");
+                if (termTabs.length === 0) addTerminal();
+              }}>$ Terminal</button>
             </>}
             <button className="tb-run-btn generic" onClick={() => { setPanelMode("output"); setIsPanelOpen(p => !p); }}>Output</button>
             <button className={`tb-run-btn generic${showAi ? " active" : ""}`} style={showAi ? { background: "rgba(0,122,204,0.15)", borderColor: "#007acc", color: "#3794ff" } : {}} onClick={() => setShowAi(p => !p)}>⬡ Copilot</button>
@@ -2107,57 +2531,348 @@ export default function App() {
 
             {/* ── PANEL ── */}
             {isPanelOpen && (
-              <div className="vsc-panel" style={{ height: panelHeight }}>
-                <div className="vsc-panel-resize" onMouseDown={startPanelDrag} />
-                <div className="vsc-panel-tabs">
-                  <button className={`vsc-panel-tab${panelMode === "output" ? " active" : ""}`} onClick={() => setPanelMode("output")}>Output</button>
-                  <div style={{ width: 1, height: 20, background: "#3c3c3c", margin: "auto 4px" }} />
-                  {termTabs.map(tab => {
-                    const isAct = panelMode === "terminal" && activeTermId === tab.id;
-                    return (
-                      <div key={tab.id} style={{ display: "flex", alignItems: "stretch" }}>
-                        <button className={`vsc-panel-tab${isAct ? " active" : ""}`}
-                          style={{ paddingLeft: 10 }}
-                          onClick={() => { setPanelMode("terminal"); setActiveTermId(tab.id); }}>
-                          <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" style={{ opacity: 0.7 }}><path d="M6 9a.5.5 0 01.5-.5h4a.5.5 0 010 1H6.5A.5.5 0 016 9zM3.854 4.146a.5.5 0 100 .708L4.793 5.5 3.854 6.354a.5.5 0 10.708.708l1.5-1.5a.5.5 0 000-.708l-1.5-1.5a.5.5 0 00-.708 0z"/><path fillRule="evenodd" d="M0 4a2 2 0 012-2h12a2 2 0 012 2v8a2 2 0 01-2 2H2a2 2 0 01-2-2V4zm2-1a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H2z"/></svg>
-                          {tab.label}
+              <div
+                className="vsc-panel"
+                style={{
+                  height: isPanelMax ? "100%" : panelHeight,
+                  display: "flex", flexDirection: "column",
+                  position: isPanelMax ? "absolute" : "relative",
+                  inset: isPanelMax ? 0 : undefined,
+                  zIndex: isPanelMax ? 50 : undefined,
+                }}
+              >
+                {/* Drag handle — only when not maximised */}
+                {!isPanelMax && (
+                  <div className="vsc-panel-resize" onMouseDown={startPanelDrag} />
+                )}
+
+                {/* ── Panel tab bar — exact VS Code layout ── */}
+                <div style={{
+                  display: "flex", alignItems: "center",
+                  height: 35, flexShrink: 0,
+                  background: "#252526",
+                  borderTop: "1px solid #1a1a1a",
+                  borderBottom: "1px solid #1a1a1a",
+                  overflow: "hidden",
+                }}>
+
+                  {/* Left: PROBLEMS / OUTPUT / TERMINAL section tabs */}
+                  <div style={{ display: "flex", alignItems: "stretch", height: "100%", flexShrink: 0 }}>
+                    {(["output", "terminal"] as PanelMode[]).map(mode => {
+                      const label = mode === "output" ? "OUTPUT" : "TERMINAL";
+                      const isAct = panelMode === mode;
+                      return (
+                        <button
+                          key={mode}
+                          onClick={() => {
+                            setPanelMode(mode);
+                            if (mode === "terminal" && termTabs.length === 0) addTerminal();
+                          }}
+                          style={{
+                            display: "flex", alignItems: "center",
+                            padding: "0 14px", height: "100%",
+                            background: "transparent", border: "none",
+                            borderBottom: isAct ? "1px solid #cccccc" : "1px solid transparent",
+                            color: isAct ? "#cccccc" : "#8b8b8b",
+                            fontSize: 11, fontWeight: isAct ? 600 : 400,
+                            cursor: "pointer", letterSpacing: "0.4px",
+                            whiteSpace: "nowrap",
+                            transition: "color 0.1s",
+                          }}
+                          onMouseEnter={e => { if (!isAct) e.currentTarget.style.color = "#cccccc"; }}
+                          onMouseLeave={e => { if (!isAct) e.currentTarget.style.color = "#8b8b8b"; }}
+                        >
+                          {label}
                         </button>
-                        <button className="vsc-panel-tab-close"
-                          onClick={e => { e.stopPropagation(); const inst = termInstances.current.get(tab.id); if (inst) { try { inst.term.dispose(); } catch { } termInstances.current.delete(tab.id); } termDivRefs.current.delete(tab.id); setTermTabs(p => { const nx = p.filter(t => t.id !== tab.id); if (activeTermId === tab.id) { if (nx.length) setActiveTermId(nx[nx.length - 1].id); else { setActiveTermId(null); setPanelMode("output"); } } return nx; }); }}>×</button>
-                      </div>
-                    );
-                  })}
-                  {canEdit(myRole) && <button className="vsc-panel-tab-add" onClick={addTerminal} title="New Terminal">+</button>}
-                  <div className="vsc-panel-actions">
-                    {panelMode === "terminal" && canEdit(myRole) && <>
-                      <button className="vsc-panel-action-btn green" onClick={() => socket.emit("terminal-sync-files", { roomId: roomIdRef.current, files: filesRef.current })} title="Sync files to workspace">
-                        <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M11.534 7h3.932a.25.25 0 01.192.41l-1.966 2.36a.25.25 0 01-.384 0l-1.966-2.36a.25.25 0 01.192-.41zm-11 2h3.932a.25.25 0 00.192-.41L2.692 6.23a.25.25 0 00-.384 0L.342 8.59A.25.25 0 00.534 9z"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 11-.771-.636A6.002 6.002 0 0113.917 7H12.9A5.002 5.002 0 008 3zM3.1 9a5.002 5.002 0 008.757 2.182.5.5 0 11.771.636A6.002 6.002 0 012.083 9H3.1z"/></svg>
-                        Sync
-                      </button>
-                      <button className="vsc-panel-action-btn red" onClick={() => socket.emit("terminal-restart", { roomId: roomIdRef.current, files: filesRef.current })} title="Restart terminal">
-                        <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M11.534 7h3.932a.25.25 0 01.192.41l-1.966 2.36a.25.25 0 01-.384 0l-1.966-2.36a.25.25 0 01.192-.41zm-11 2h3.932a.25.25 0 00.192-.41L2.692 6.23a.25.25 0 00-.384 0L.342 8.59A.25.25 0 00.534 9z"/></svg>
-                        Restart
-                      </button>
-                    </>}
-                    <button className="vsc-panel-action-btn close" onClick={() => setIsPanelOpen(false)} title="Close Panel">✕</button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Divider */}
+                  <div style={{ width: 1, height: 16, background: "#3c3c3c", margin: "0 4px", flexShrink: 0 }} />
+
+                  {/* Terminal instance tabs — scrollable */}
+                  {panelMode === "terminal" && (
+                    <div style={{
+                      display: "flex", alignItems: "stretch", height: "100%",
+                      overflowX: "auto", overflowY: "hidden", flex: 1,
+                      scrollbarWidth: "none",
+                    }}>
+                      {termTabs.map(tab => {
+                        const isAct = activeTermId === tab.id;
+                        return (
+                          <div
+                            key={tab.id}
+                            style={{
+                              display: "flex", alignItems: "center",
+                              height: "100%", flexShrink: 0,
+                              background: isAct ? "#1e1e1e" : "transparent",
+                              borderRight: "1px solid #1a1a1a",
+                              borderTop: isAct ? "1px solid #007acc" : "1px solid transparent",
+                              marginTop: isAct ? -1 : 0,
+                              cursor: "pointer",
+                            }}
+                            onClick={() => { setPanelMode("terminal"); setActiveTermId(tab.id); }}
+                          >
+                            {/* Shell icon */}
+                            <span style={{ paddingLeft: 10, display: "flex", alignItems: "center", color: isAct ? "#cccccc" : "#8b8b8b" }}>
+                              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
+                                <path d="M6 9a.5.5 0 01.5-.5h4a.5.5 0 010 1H6.5A.5.5 0 016 9zM3.854 4.146a.5.5 0 100 .708L4.793 5.5 3.854 6.354a.5.5 0 10.708.708l1.5-1.5a.5.5 0 000-.708l-1.5-1.5a.5.5 0 00-.708 0z"/>
+                                <path fillRule="evenodd" d="M0 4a2 2 0 012-2h12a2 2 0 012 2v8a2 2 0 01-2 2H2a2 2 0 01-2-2V4zm2-1a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H2z"/>
+                              </svg>
+                            </span>
+
+                            {/* Label */}
+                            <span style={{
+                              padding: "0 6px 0 5px",
+                              fontSize: 12, color: isAct ? "#cccccc" : "#8b8b8b",
+                              whiteSpace: "nowrap", maxWidth: 140,
+                              overflow: "hidden", textOverflow: "ellipsis",
+                            }}>
+                              {tab.label}
+                            </span>
+
+                            {/* Kill button */}
+                            <span
+                              title="Kill Terminal"
+                              onClick={e => { e.stopPropagation(); killTerminalTab(tab.id); }}
+                              style={{
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                                width: 18, height: 18, borderRadius: 3, marginRight: 4,
+                                color: "#8b8b8b", fontSize: 14, lineHeight: 1, flexShrink: 0,
+                                cursor: "pointer",
+                              }}
+                              onMouseEnter={e => {
+                                (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.12)";
+                                (e.currentTarget as HTMLElement).style.color = "#cccccc";
+                              }}
+                              onMouseLeave={e => {
+                                (e.currentTarget as HTMLElement).style.background = "transparent";
+                                (e.currentTarget as HTMLElement).style.color = "#8b8b8b";
+                              }}
+                            >
+                              ×
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Spacer when output mode */}
+                  {panelMode === "output" && <div style={{ flex: 1 }} />}
+
+                  {/* Terminal path input — shown when terminal is active */}
+                  {panelMode === "terminal" && canEdit(myRole) && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: 4, marginRight: 4 }}>
+                      <span style={{ fontSize: 11, color: "#6a6a6a", whiteSpace: "nowrap" }}>cd:</span>
+                      <input
+                        id="terminal-cd-input"
+                        placeholder={openFolderName ? `C:\\Projects\\${openFolderName}` : "C:\\path\\to\\project"}
+                        defaultValue={(window as any).__terminalCdPath ?? ""}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") {
+                            const val = (e.target as HTMLInputElement).value.trim();
+                            if (!val) return;
+                            // Store globally for new terminals
+                            (window as any).__terminalCdPath = val;
+                            // Send cd to all open terminals right now
+                            termInstances.current.forEach((inst, tid) => {
+                              if (roomIdRef.current) {
+                                socket.emit("terminal-input", {
+                                  roomId: roomIdRef.current,
+                                  data: `cd "${val}"\r`,
+                                });
+                              }
+                            });
+                            (e.target as HTMLInputElement).blur();
+                          }
+                          if (e.key === "Escape") {
+                            (e.target as HTMLInputElement).blur();
+                          }
+                        }}
+                        style={{
+                          background: "#3c3c3c",
+                          border: "1px solid #555",
+                          borderRadius: 3,
+                          color: "#cccccc",
+                          fontSize: 11,
+                          padding: "2px 6px",
+                          width: 200,
+                          outline: "none",
+                          fontFamily: "var(--font-mono, monospace)",
+                        }}
+                        onFocus={e => { e.target.style.borderColor = "#007acc"; }}
+                        onBlur={e => { e.target.style.borderColor = "#555"; }}
+                      />
+                      <span style={{ fontSize: 10, color: "#6a6a6a" }}>↵</span>
+                    </div>
+                  )}
+
+                  {/* Right: action icons — always visible */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 2, paddingRight: 6, flexShrink: 0, marginLeft: panelMode === "terminal" ? 0 : "auto" }}>
+
+                    {/* New Terminal */}
+                    {canEdit(myRole) && (
+                      <PanelIconBtn title="New Terminal (Ctrl+Shift+`)" onClick={addTerminal}>
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M8 4a.5.5 0 01.5.5v3h3a.5.5 0 010 1h-3v3a.5.5 0 01-1 0v-3h-3a.5.5 0 010-1h3v-3A.5.5 0 018 4z"/>
+                        </svg>
+                      </PanelIconBtn>
+                    )}
+
+                    {/* Split Terminal (visual only — opens new tab) */}
+                    {canEdit(myRole) && panelMode === "terminal" && (
+                      <PanelIconBtn title="Split Terminal" onClick={() => addTerminal()}>
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M8 1h7v14H8V1zm1 1v12h5V2H9zM1 1h6v6H1V1zm1 1v4h4V2H2zm-1 7h6v6H1V9zm1 1v4h4v-4H2z"/>
+                        </svg>
+                      </PanelIconBtn>
+                    )}
+
+                    {/* Sync files */}
+                    {canEdit(myRole) && panelMode === "terminal" && (
+                      <PanelIconBtn
+                        title="Sync files to workspace"
+                        onClick={() => {
+                          socket.emit("terminal-sync-files", { roomId: roomIdRef.current, files: filesRef.current });
+                        }}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M11.534 7h3.932a.25.25 0 01.192.41l-1.966 2.36a.25.25 0 01-.384 0l-1.966-2.36a.25.25 0 01.192-.41zm-11 2h3.932a.25.25 0 00.192-.41L2.692 6.23a.25.25 0 00-.384 0L.342 8.59A.25.25 0 00.534 9z"/>
+                          <path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 11-.771-.636A6.002 6.002 0 0113.917 7H12.9A5.002 5.002 0 008 3zM3.1 9a5.002 5.002 0 008.757 2.182.5.5 0 11.771.636A6.002 6.002 0 012.083 9H3.1z"/>
+                        </svg>
+                      </PanelIconBtn>
+                    )}
+
+                    {/* Kill terminal */}
+                    {canEdit(myRole) && panelMode === "terminal" && activeTermId && (
+                      <PanelIconBtn
+                        title="Kill Terminal"
+                        onClick={() => activeTermId && killTerminalTab(activeTermId)}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M4.47 3.763L3.763 4.47 7.293 8l-3.53 3.53.707.707L8 8.707l3.53 3.53.707-.707L8.707 8l3.53-3.53-.707-.707L8 7.293 4.47 3.763z"/>
+                        </svg>
+                      </PanelIconBtn>
+                    )}
+
+                    {/* Restart */}
+                    {canEdit(myRole) && panelMode === "terminal" && (
+                      <PanelIconBtn
+                        title="Restart Terminal"
+                        onClick={() => socket.emit("terminal-restart", { roomId: roomIdRef.current })}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M8 3a5 5 0 10.001 10A5 5 0 008 3zm0 1a4 4 0 110 8A4 4 0 018 4zm-.5 1.5v3.25l2.5 1.5-.5.866L7 10.5V5.5h.5z"/>
+                        </svg>
+                      </PanelIconBtn>
+                    )}
+
+                    {/* Separator */}
+                    <div style={{ width: 1, height: 14, background: "#3c3c3c", margin: "0 2px" }} />
+
+                    {/* Maximise / Restore */}
+                    <PanelIconBtn
+                      title={isPanelMax ? "Restore Panel Size" : "Maximise Panel"}
+                      onClick={() => setIsPanelMax(p => !p)}
+                    >
+                      {isPanelMax ? (
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M5 5h6v6H5V5zm1 1v4h4V6H6z"/>
+                          <path d="M1 1h5v1H2v4H1V1zm9 0h5v5h-1V2h-4V1zM1 10h1v4h4v1H1v-5zm13 4h-4v1h5v-5h-1v4z"/>
+                        </svg>
+                      ) : (
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                          <path d="M1.5 1h4v1h-3v3h-1V1zm9 0h4v4h-1V2h-3V1zM1.5 15v-4h1v3h3v1h-4zm13 0h-4v-1h3v-3h1v4z"/>
+                        </svg>
+                      )}
+                    </PanelIconBtn>
+
+                    {/* Close panel */}
+                    <PanelIconBtn title="Close Panel" onClick={() => { setIsPanelOpen(false); setIsPanelMax(false); }}>
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                        <path d="M4.47 3.763L3.763 4.47 7.293 8l-3.53 3.53.707.707L8 8.707l3.53 3.53.707-.707L8.707 8l3.53-3.53-.707-.707L8 7.293 4.47 3.763z"/>
+                      </svg>
+                    </PanelIconBtn>
                   </div>
                 </div>
+
+                {/* ── Panel body ── */}
+
+                {/* OUTPUT */}
                 {panelMode === "output" && (
-                  <div className="vsc-output-content">
-                    {output.length === 0 ? <span className="vsc-output-empty">No output yet. Press Run to execute.</span> : output.map((l, i) => <div key={i} className="vsc-output-line">{l}</div>)}
+                  <div className="vsc-output-content" style={{ flex: 1, overflowY: "auto", padding: "8px 12px", background: "#1e1e1e" }}>
+                    {output.length === 0
+                      ? <span className="vsc-output-empty">No output yet. Press Run to execute.</span>
+                      : output.map((l, i) => <div key={i} className="vsc-output-line">{l}</div>)
+                    }
                   </div>
                 )}
-                {panelMode === "terminal" && termTabs.map(tab => (
-                  <div key={tab.id} ref={div => mountTerminal(tab.id, div as HTMLDivElement | null)}
-                    style={{ flex: 1, overflow: "hidden", padding: "4px 0 0 6px", background: "#1e1e1e", display: activeTermId === tab.id ? "flex" : "none", flexDirection: "column" }} />
-                ))}
-                {panelMode === "terminal" && termTabs.length === 0 && (
-                  <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, color: "#6a6a6a" }}>
-                    <svg width="28" height="28" viewBox="0 0 16 16" fill="#6a6a6a"><path d="M6 9a.5.5 0 01.5-.5h4a.5.5 0 010 1H6.5A.5.5 0 016 9zM3.854 4.146a.5.5 0 100 .708L4.793 5.5 3.854 6.354a.5.5 0 10.708.708l1.5-1.5a.5.5 0 000-.708l-1.5-1.5a.5.5 0 00-.708 0z"/><path fillRule="evenodd" d="M0 4a2 2 0 012-2h12a2 2 0 012 2v8a2 2 0 01-2 2H2a2 2 0 01-2-2V4zm2-1a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H2z"/></svg>
-                    <span style={{ fontSize: 13 }}>No terminal open</span>
-                    {canEdit(myRole) && <button className="btn btn-secondary" style={{ fontSize: 12 }} onClick={addTerminal}>+ New Terminal</button>}
-                  </div>
-                )}
+
+                {/* TERMINAL instances — always rendered when terminal mode so divs keep size */}
+                <div style={{
+                  flex: 1,
+                  display: panelMode === "terminal" ? "flex" : "none",
+                  flexDirection: "column",
+                  overflow: "hidden",
+                  position: "relative",
+                  background: "#1e1e1e",
+                }}>
+                  {termTabs.length === 0 ? (
+                      <div style={{
+                        flex: 1, display: "flex", flexDirection: "column",
+                        alignItems: "center", justifyContent: "center",
+                        gap: 12, color: "#6a6a6a", background: "#1e1e1e",
+                      }}>
+                        <svg width="36" height="36" viewBox="0 0 16 16" fill="#4a4a4a">
+                          <path d="M6 9a.5.5 0 01.5-.5h4a.5.5 0 010 1H6.5A.5.5 0 016 9zM3.854 4.146a.5.5 0 100 .708L4.793 5.5 3.854 6.354a.5.5 0 10.708.708l1.5-1.5a.5.5 0 000-.708l-1.5-1.5a.5.5 0 00-.708 0z"/>
+                          <path fillRule="evenodd" d="M0 4a2 2 0 012-2h12a2 2 0 012 2v8a2 2 0 01-2 2H2a2 2 0 01-2-2V4zm2-1a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H2z"/>
+                        </svg>
+                        <span style={{ fontSize: 13 }}>No active terminal</span>
+                        {canEdit(myRole) && (
+                          <button
+                            onClick={() => addTerminal()}
+                            style={{
+                              background: "rgba(0,122,204,0.15)", border: "1px solid rgba(0,122,204,0.4)",
+                              borderRadius: 4, color: "#3794ff", fontSize: 12.5,
+                              padding: "6px 16px", cursor: "pointer",
+                              display: "flex", alignItems: "center", gap: 6,
+                            }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                              <path d="M8 4a.5.5 0 01.5.5v3h3a.5.5 0 010 1h-3v3a.5.5 0 01-1 0v-3h-3a.5.5 0 010-1h3v-3A.5.5 0 018 4z"/>
+                            </svg>
+                            New Terminal
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      termTabs.map(tab => (
+                        <div
+                          key={tab.id}
+                          ref={div => mountTerminal(tab.id, div as HTMLDivElement | null)}
+                          style={{
+                            flex: 1,
+                            // Must be position:relative so xterm's canvas positions correctly
+                            position: "relative",
+                            overflow: "hidden",
+                            padding: "4px 0 0 4px",
+                            background: "#1e1e1e",
+                            // Use visibility instead of display:none so xterm
+                            // keeps its dimensions even when tab is not active
+                            display: "flex",
+                            flexDirection: "column",
+                            visibility: activeTermId === tab.id ? "visible" : "hidden",
+                            // When hidden, collapse to 0 height so it doesn't take space
+                            height: activeTermId === tab.id ? "100%" : 0,
+                            width: activeTermId === tab.id ? "100%" : 0,
+                            pointerEvents: activeTermId === tab.id ? "auto" : "none",
+                          }}
+                        />
+                      ))
+                    )}
+                </div>
               </div>
             )}
           </div>
@@ -2193,6 +2908,18 @@ export default function App() {
                 <div className="vsc-status-item">UTF-8</div>
               </>
             )}
+            {panelMode === "terminal" && activeTermId && (() => {
+              const t = termTabs.find(t => t.id === activeTermId);
+              return t ? (
+                <div className="vsc-status-item" style={{ color: "#4ec9b0" }}>
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor" style={{ marginRight: 3 }}>
+                    <path d="M6 9a.5.5 0 01.5-.5h4a.5.5 0 010 1H6.5A.5.5 0 016 9zM3.854 4.146a.5.5 0 100 .708L4.793 5.5 3.854 6.354a.5.5 0 10.708.708l1.5-1.5a.5.5 0 000-.708l-1.5-1.5a.5.5 0 00-.708 0z"/>
+                    <path fillRule="evenodd" d="M0 4a2 2 0 012-2h12a2 2 0 012 2v8a2 2 0 01-2 2H2a2 2 0 01-2-2V4zm2-1a1 1 0 00-1 1v8a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H2z"/>
+                  </svg>
+                  {t.shell ?? "bash"}
+                </div>
+              ) : null;
+            })()}
             <div className="vsc-status-item" onClick={() => setShowCmdPalette(true)} title="Command Palette">
               <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M14 2H2a1 1 0 00-1 1v10a1 1 0 001 1h12a1 1 0 001-1V3a1 1 0 00-1-1z"/></svg>
             </div>

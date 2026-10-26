@@ -127,6 +127,12 @@ const codeDebounce   = new Map<string, ReturnType<typeof setTimeout>>();
 const ACTIVITY_CAP   = 200;
 const CHAT_CAP       = 300;
 
+// socketId → roomId: lets terminal handlers find the room without a payload field
+const socketRoom     = new Map<string, string>();
+
+// socketId → queued input data while join-room is still resolving
+const pendingInput   = new Map<string, string[]>();
+
 // ─── Role helpers ─────────────────────────────────────────────────────────────
 
 function getRole(roomId: string, socketId: string): Role | undefined {
@@ -252,11 +258,25 @@ io.on("connection", (socket) => {
       await assignRole(roomId, user.uid, role);
       if (!usersInRoom.has(socket.id)) usersInRoom.set(socket.id, { ...user, socketId: socket.id, role });
 
+      // Track which room this socket is in — used by terminal handlers to
+      // resolve role without requiring roomId in every payload
+      socketRoom.set(socket.id, roomId);
+
       broadcastRoomUsers(roomId);
       socket.emit("your-role", { role });
 
-      const history = terminalManager.getHistory(roomId);
-      if (history.length > 0) socket.emit("terminal-history", history.join(""));
+      // Send this socket's own terminal history (per-socket session)
+      const history = terminalManager.getHistory(socket.id);
+      if (history.length > 0) socket.emit("terminal-history", history);
+
+      // Flush any input that arrived before join-room finished
+      const queued = pendingInput.get(socket.id);
+      if (queued?.length && canEdit(role)) {
+        pendingInput.delete(socket.id);
+        for (const data of queued) terminalManager.write(socket.id, data);
+      } else {
+        pendingInput.delete(socket.id);
+      }
 
       try {
         // ── Load room metadata from MongoDB (unchanged) ────────────────────
@@ -305,7 +325,10 @@ io.on("connection", (socket) => {
   socket.on(
     "change-role",
     async ({ roomId, targetUid, newRole }: { roomId: string; targetUid: string; newRole: Role }) => {
-      if (getRole(roomId, socket.id) !== "owner") {
+      // Check in-memory role first, then fall back to persisted roles
+      // (handles the race where roomUsers isn't populated yet)
+      const actorRole = getRole(roomId, socket.id);
+      if (actorRole !== "owner") {
         socket.emit("permission-denied", { action: "change-role", reason: "Only the owner can change roles" });
         return;
       }
@@ -330,8 +353,8 @@ io.on("connection", (socket) => {
         return;
       }
       socket.to(roomId).emit("receive-code", { fileName, code });
-      persistFileDebounced(roomId, fileName, code);           // → disk
-      terminalManager.syncFiles(roomId, { [fileName]: code }); // unchanged
+      // persistFileDebounced writes to disk — no need for syncFiles here
+      persistFileDebounced(roomId, fileName, code);
     }
   );
 
@@ -522,11 +545,12 @@ io.on("connection", (socket) => {
         return;
       }
 
-      terminalManager.syncFiles(roomId, files);
+      // Ensure PTY exists without blocking on file sync
       terminalManager.getOrCreate(
+        socket.id,
         roomId,
-        (d) => io.to(roomId).emit("terminal-output", d),
-        (c) => io.to(roomId).emit("terminal-exit", { code: c })
+        (d) => socket.emit("terminal-output", d),
+        (c) => socket.emit("terminal-exit", { code: c })
       );
 
       const ext  = fileName.split(".").pop()?.toLowerCase() ?? "";
@@ -556,19 +580,49 @@ io.on("connection", (socket) => {
       }
 
       if (!cmd) {
-        io.to(roomId).emit("terminal-output", `\r\n\x1b[33m⚠ Don't know how to run .${ext} files — type your command below.\x1b[0m\r\n`);
-        io.to(roomId).emit("terminal-switch-panel");
+        socket.emit("terminal-output", `\r\n\x1b[33m⚠ Don't know how to run .${ext} files — type your command below.\x1b[0m\r\n`);
+        socket.emit("terminal-switch-panel");
         return;
       }
 
-      io.to(roomId).emit("terminal-switch-panel");
-      io.to(roomId).emit("terminal-output",
+      socket.emit("terminal-switch-panel");
+      socket.emit("terminal-output",
         `\r\n\x1b[36m$ ${cmd}\x1b[0m\r\n\x1b[90m${"─".repeat(50)}\x1b[0m\r\n`
       );
-      terminalManager.write(roomId, cmd + "\r");
+      terminalManager.write(socket.id, cmd + "\r");
 
       const user = getUser(roomId, socket.id);
       if (user) await broadcastActivity(roomId, user, "ran code", fileName);
+    }
+  );
+
+  // ── folder-sync — lightweight folder-open notification ─────────────────────
+  // Receives file PATHS only (no content) so the socket payload stays tiny.
+  // Terminal workspace is populated lazily by code-change events as files open.
+  socket.on(
+    "folder-sync",
+    async ({ roomId, folderName, filePaths, files }: {
+      roomId:      string;
+      folderName:  string;
+      filePaths?:  string[];
+      files?:      Record<string, string>;
+    }) => {
+      if (!canEdit(getRole(roomId, socket.id))) {
+        socket.emit("permission-denied", { action: "folder-sync", reason: "Viewers cannot upload folders" });
+        return;
+      }
+
+      // Legacy support: if old client sends full files, sync async (non-blocking)
+      if (!filePaths && files && Object.keys(files).length > 0) {
+        terminalManager.syncFiles(roomId, files);
+      }
+      // New path-only payload: no sync needed, workspace populated by code-change
+
+      const user = getUser(roomId, socket.id);
+      const count = filePaths?.length ?? (files ? Object.keys(files).length : 0);
+      if (user) {
+        await broadcastActivity(roomId, user, "opened folder", `${folderName} (${count} files)`);
+      }
     }
   );
 
@@ -624,53 +678,115 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("user-active-file", { socketId, fileName });
   });
 
-  // ── Terminal ──────────────────────────────────────────────────────────────────
-  // TASK 3: terminal cwd is /workspaces/{roomId} — handled by terminalManager
-  // No changes needed here; terminal.ts sets cwd = getWorkspacePath(roomId)
+  // ── Terminal — per-socket PTY sessions ───────────────────────────────────────
+  //
+  // Each socket (browser tab) gets its own independent PTY.
+  // Output goes only to that socket, not broadcast to the room.
+  // This means every user can cd anywhere and run anything independently.
 
-  socket.on("terminal-join", ({ roomId, files }: { roomId: string; files: Record<string, string> }) => {
-    terminalManager.syncFiles(roomId, files);
-    const { terminal, isNew } = terminalManager.getOrCreate(
+  socket.on("terminal-join", ({ roomId, cols, rows }: {
+    roomId: string;
+    files?: Record<string, string>; // ignored — workspace already has files
+    cols?:  number;
+    rows?:  number;
+  }) => {
+    // DO NOT sync files here — that blocks the event loop for large projects.
+    // Files are written to disk by folder-sync and code-change events.
+    // Just spawn the PTY immediately.
+
+    const { session, isNew } = terminalManager.getOrCreate(
+      socket.id,
       roomId,
-      (d) => io.to(roomId).emit("terminal-output", d),
-      (c) => io.to(roomId).emit("terminal-exit", { code: c })
+      (d) => socket.emit("terminal-output", d),
+      (c) => socket.emit("terminal-exit", { code: c }),
+      cols ?? 120,
+      rows ?? 30,
     );
-    const h = terminalManager.getHistory(roomId);
-    if (h.length > 0) socket.emit("terminal-history", h.join(""));
-    if (isNew) socket.emit("terminal-output", `\x1b[36m┌─ Collab Terminal · Room: ${roomId}\x1b[0m\r\n\x1b[36m└─ ${terminal.workDir}\x1b[0m\r\n\r\n`);
+
+    const role = getRole(roomId, socket.id);
+
+    if (isNew) {
+      const roleLabel = role === "viewer"
+        ? `\x1b[33m│  Read-only — ask owner for edit access\x1b[0m`
+        : `\x1b[32m│  Role: ${role ?? "editor"}\x1b[0m`;
+      socket.emit("terminal-output",
+        `\x1b[36m╭─ CodeCollab Terminal\x1b[0m\r\n` +
+        `\x1b[36m│\x1b[0m  Room: ${roomId}\r\n` +
+        `${roleLabel}\r\n` +
+        `\x1b[36m│\x1b[0m  Dir:  ${session.workDir}\r\n` +
+        `\x1b[36m╰──────────────────────────\x1b[0m\r\n\r\n`
+      );
+    } else {
+      const history = terminalManager.getHistory(socket.id);
+      if (history.length > 0) socket.emit("terminal-history", history);
+    }
   });
 
-  socket.on("terminal-input", ({ roomId, data }: { roomId: string; data: string }) => {
-    if (!canEdit(getRole(roomId, socket.id))) { socket.emit("permission-denied", { action: "terminal-input", reason: "Viewers cannot type in terminal" }); return; }
-    terminalManager.write(roomId, data);
+  socket.on("terminal-input", ({ roomId: payloadRoomId, data }: { roomId: string; data: string }) => {
+    // Resolve roomId from socketRoom map (populated by join-room) as the
+    // canonical source of truth — falls back to payload if available
+    const roomId = socketRoom.get(socket.id) ?? payloadRoomId;
+    const role   = getRole(roomId, socket.id);
+
+    // Race condition: join-room not yet complete (role === undefined)
+    // Queue the input and flush it after join-room sets the role
+    if (role === undefined) {
+      const q = pendingInput.get(socket.id) ?? [];
+      q.push(data);
+      pendingInput.set(socket.id, q);
+      return;
+    }
+
+    // Viewers cannot type — silently drop (frontend already shows hint)
+    if (!canEdit(role)) return;
+
+    if (!terminalManager.hasSession(socket.id)) {
+      terminalManager.getOrCreate(
+        socket.id, roomId,
+        (d) => socket.emit("terminal-output", d),
+        (c) => socket.emit("terminal-exit", { code: c }),
+      );
+    }
+    terminalManager.write(socket.id, data);
   });
 
-  socket.on("terminal-resize", ({ roomId, cols, rows }: { roomId: string; cols: number; rows: number }) => {
-    terminalManager.resize(roomId, cols, rows);
+  socket.on("terminal-resize", ({ cols, rows }: { roomId: string; cols: number; rows: number }) => {
+    terminalManager.resize(socket.id, cols, rows);
   });
 
   socket.on("terminal-sync-files", ({ roomId, files }: { roomId: string; files: Record<string, string> }) => {
     if (!canEdit(getRole(roomId, socket.id))) return;
-    terminalManager.syncFiles(roomId, files);
-    socket.emit("terminal-output", "\x1b[32m✓ Files synced to terminal workspace\x1b[0m\r\n");
+    // This is the ONLY intentional full sync — triggered by user pressing Sync button
+    socket.emit("terminal-output", "\x1b[90mSyncing files to workspace...\x1b[0m\r\n");
+    terminalManager.syncFiles(roomId, files); // async — won't block
+    socket.emit("terminal-output", "\x1b[32m✓ Sync started (files writing in background)\x1b[0m\r\n");
   });
 
   socket.on("terminal-restart", ({ roomId, files }: { roomId: string; files: Record<string, string> }) => {
     if (!canEdit(getRole(roomId, socket.id))) return;
-    terminalManager.syncFiles(roomId, files);
-    const t = terminalManager.respawn(
-      roomId,
-      (d) => io.to(roomId).emit("terminal-output", d),
-      (c) => io.to(roomId).emit("terminal-exit", { code: c })
+    // Async file sync — don't block PTY restart
+    if (files && Object.keys(files).length > 0) {
+      terminalManager.syncFiles(roomId, files);
+    }
+    const s = terminalManager.respawn(
+      socket.id, roomId,
+      (d) => socket.emit("terminal-output", d),
+      (c) => socket.emit("terminal-exit", { code: c }),
     );
-    io.to(roomId).emit("terminal-output", `\x1b[33m♻  Terminal restarted · ${t.workDir}\x1b[0m\r\n`);
+    socket.emit("terminal-output",
+      `\x1b[33m♻  Terminal restarted\x1b[0m\r\n` +
+      `\x1b[36m   Dir: ${s.workDir}\x1b[0m\r\n\r\n`
+    );
     const user = getUser(roomId, socket.id);
     if (user) void broadcastActivity(roomId, user, "restarted terminal");
   });
 
   socket.on("terminal-run-project", ({ roomId, files }: { roomId: string; files: Record<string, string> }) => {
-    if (!canEdit(getRole(roomId, socket.id))) { socket.emit("permission-denied", { action: "terminal-run-project", reason: "Viewers cannot run projects" }); return; }
-    terminalManager.syncFiles(roomId, files);
+    if (!canEdit(getRole(roomId, socket.id))) {
+      socket.emit("permission-denied", { action: "terminal-run-project", reason: "Viewers cannot run projects" });
+      return;
+    }
+    // No blocking syncFiles — workspace already has files from code-change/folder-sync
     const names    = Object.keys(files);
     const hasPkg   = names.some(f => f === "package.json" || f.endsWith("/package.json"));
     const hasPyReq = names.some(f => f === "requirements.txt");
@@ -687,28 +803,71 @@ io.on("connection", (socket) => {
       } catch { cmd = "npm install && npm start"; }
     } else if (hasPyReq || hasMain) {
       cmd = hasPyReq ? "pip install -r requirements.txt && python main.py" : "python main.py";
-    } else if (hasGo) { cmd = "go run ."; }
-    else if (hasRust)  { cmd = "cargo run"; }
-    else { io.to(roomId).emit("terminal-output", "\x1b[33m⚠ Could not detect project type. Type your run command.\x1b[0m\r\n"); return; }
+    } else if (hasGo)   { cmd = "go run ."; }
+    else if (hasRust)   { cmd = "cargo run"; }
+    else {
+      socket.emit("terminal-output", "\x1b[33m⚠ Could not detect project type. Type your run command.\x1b[0m\r\n");
+      return;
+    }
 
-    terminalManager.getOrCreate(roomId, (d) => io.to(roomId).emit("terminal-output", d), (c) => io.to(roomId).emit("terminal-exit", { code: c }));
-    io.to(roomId).emit("terminal-output", `\r\n\x1b[36m$ ${cmd}\x1b[0m\r\n\x1b[90m${"─".repeat(50)}\x1b[0m\r\n`);
-    terminalManager.write(roomId, cmd + "\r");
+    terminalManager.getOrCreate(
+      socket.id, roomId,
+      (d) => socket.emit("terminal-output", d),
+      (c) => socket.emit("terminal-exit", { code: c }),
+    );
+    socket.emit("terminal-output",
+      `\r\n\x1b[36m$ ${cmd}\x1b[0m\r\n\x1b[90m${"─".repeat(50)}\x1b[0m\r\n`
+    );
+    terminalManager.write(socket.id, cmd + "\r");
+
     const user = getUser(roomId, socket.id);
     if (user) void broadcastActivity(roomId, user, "ran project", cmd);
   });
 
-  // ── leave / disconnect ────────────────────────────────────────────────────────
-  // UNCHANGED
+  // ── terminal-ensure — used by Run/Project when terminal may be dead ──────────
+  // Guarantees a live PTY session exists for this socket without sending
+  // the full welcome banner. Safe to call even if session already exists.
+  socket.on("terminal-ensure", ({ roomId, cols, rows }: {
+    roomId: string; files?: Record<string, string>; cols?: number; rows?: number;
+  }) => {
+    if (!canEdit(getRole(roomId, socket.id))) return;
+    // No syncFiles here — just ensure PTY exists
+    const { isNew } = terminalManager.getOrCreate(
+      socket.id, roomId,
+      (d) => socket.emit("terminal-output", d),
+      (c) => socket.emit("terminal-exit", { code: c }),
+      cols ?? 120, rows ?? 30,
+    );
+    if (isNew) {
+      const ws = terminalManager.getSession(socket.id)?.workDir ?? "";
+      socket.emit("terminal-output",
+        `\x1b[36m[Terminal ready — ${ws}]\x1b[0m\r\n\r\n`
+      );
+    }
+  });
+
+  // ── terminal-kill — client killed a tab, clean up the server PTY ─────────────
+  socket.on("terminal-kill", ({ roomId }: { roomId: string }) => {
+    terminalManager.kill(socket.id);
+    console.log(`[terminal] Client killed PTY for socket ${socket.id} in room ${roomId}`);
+  });
   socket.on("leave-room", (roomId: string) => {
     socket.leave(roomId);
     const room = roomUsers.get(roomId);
     if (room) {
       room.delete(socket.id);
-      if (room.size === 0) { roomUsers.delete(roomId); terminalManager.kill(roomId); }
-      else broadcastRoomUsers(roomId);
+      if (room.size === 0) {
+        roomUsers.delete(roomId);
+        terminalManager.killAllForRoom(roomId);
+      } else {
+        broadcastRoomUsers(roomId);
+      }
     }
+    // Kill this socket's own PTY session
+    terminalManager.kill(socket.id);
     lastCursorHash.delete(socket.id);
+    socketRoom.delete(socket.id);
+    pendingInput.delete(socket.id);
   });
 
   socket.on("disconnecting", () => {
@@ -717,14 +876,26 @@ io.on("connection", (socket) => {
       const room = roomUsers.get(roomId);
       if (room) {
         room.delete(socket.id);
-        if (room.size === 0) { roomUsers.delete(roomId); terminalManager.kill(roomId); }
-        else broadcastRoomUsers(roomId);
+        if (room.size === 0) {
+          roomUsers.delete(roomId);
+          terminalManager.killAllForRoom(roomId);
+        } else {
+          broadcastRoomUsers(roomId);
+        }
       }
     });
+    // Kill this socket's own PTY session on any disconnect
+    terminalManager.kill(socket.id);
     lastCursorHash.delete(socket.id);
+    socketRoom.delete(socket.id);
+    pendingInput.delete(socket.id);
   });
 
-  socket.on("disconnect", () => console.log("Socket disconnected:", socket.id));
+  socket.on("disconnect", () => {
+    socketRoom.delete(socket.id);
+    pendingInput.delete(socket.id);
+    console.log("Socket disconnected:", socket.id);
+  });
 });
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
